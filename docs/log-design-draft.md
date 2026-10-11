@@ -22,7 +22,7 @@ One reusable data structure, the **block log** (`BlockLog`), is pointed at a dir
   - **mirror**: a local clone of the server's log.
 - Whenever the full sorted history is needed, k-way merge all blocks from both client logs.
 
-Intended `BlockLog` surface (sketch): `append(entry)`, `manifest()`, block and open-entry readers, a way to adopt a whole sealed block, and a merged iterator over any set of logs.
+Intended `BlockLog` surface (sketch): `append(entry)`, `blocks()`, block and open-entry readers, a way to adopt a whole sealed block, and a merged iterator over any set of logs.
 
 ## Data model
 
@@ -54,7 +54,9 @@ One line of JSONL per review (final schema TBD):
 - **In-progress block:** stored in arrival order (on the server this interleaves devices). Sorted in memory when needed.
 - **Sealed block:** immutable. Sorted once by `(t, d)` at seal time. Because the key is unique and total, every machine produces byte-identical bytes regardless of the order entries arrived in.
 - Blocks are numbered. The server assigns block numbers in creation order. The in-progress block keeps its number even if sealed blocks are adopted after it; it is therefore not necessarily the highest-numbered block.
-- Each block has a manifest entry: block number, entry count, min/max `t`, content hash, format version. Sync compares manifests. The version field is the escape hatch for migrations.
+- **The directory is the source of truth; there is no manifest.** A sealed block exists once its file has been atomically renamed into place (temp file + rename). Block numbers are never reused: the next number is one more than the highest across `sealed/` and `open/`, and there is at most one open file. If `sealed/N` exists, `open/N` is stale and is removed on open.
+- Per-block facts (entry count, min/max `t`, content hash) are derived data. They live in an optional `index.json` cache that is rebuilt from the block files when it is missing, stale or corrupt. Sync can use them to compare blocks, and `maxT()` reads them instead of scanning.
+- A one-line `VERSION` file holds the format version (the escape hatch for migrations). The block size is a constant and is not stored: a block seals when it reaches that size, so existing blocks stay valid if the constant changes.
 - A client's local log only holds its own entries in increasing `t`, so local blocks are sorted by construction.
 
 ### Layout (sketch)
@@ -62,12 +64,14 @@ One line of JSONL per review (final schema TBD):
 ```
 <log dir>/                 # excluded from Syncthing
   local/
-    manifest.json
-    open.jsonl
+    VERSION
+    index.json             # optional cache
+    open/000002.jsonl      # at most one in-progress block
     sealed/000001.jsonl
   mirror/
-    manifest.json
-    open.jsonl
+    VERSION
+    index.json
+    open/000004.jsonl
     sealed/000001.jsonl
 ```
 
@@ -98,8 +102,8 @@ Names are placeholders. Sealed blocks may later be gzipped (see `storage-notes.m
 1. Flush any reviews still held in memory for undo (see below) into the local log.
 2. Upload the full sealed local blocks whole, in order, plus the entries of the local open block as loose entries. The local open block is not force-sealed, so blocks stay at 1,000 entries.
 3. The server replies with the device's mark (last `t` received) and the result.
-4. Pull: the manifest comparison gives the sealed blocks the client lacks; for any block it holds only in part, the client sends a per-device map of the last `t` it holds and gets the rest (see Pull cursor).
-5. Record the pulled data in the mirror manifest in one atomic update.
+4. Pull: comparing block numbers and hashes gives the sealed blocks the client lacks; for any block it holds only in part, the client sends a per-device map of the last `t` it holds and gets the rest (see Pull cursor).
+5. Place each pulled sealed block into the mirror atomically (temp file + rename), and append pulled open-block entries to the mirror's open block.
 6. Cleanup: delete acknowledged sealed local blocks; rewrite the local open file without acknowledged entries, but keep the newest entry.
 
 ### Server side
@@ -122,7 +126,7 @@ The server replies with:
 
 If the server has sealed the client's partial block and also started a new open block, the client sends the partial block's map and asks for the new open block with an empty map (everything).
 
-Once the client's copy of a block is complete it sorts it locally and checks the manifest hash. A match means the block is final; a mismatch means fetch the sealed block whole.
+Once the client's copy of a block is complete it sorts it locally and checks the block's hash against the server's. A match means the block is final; a mismatch means fetch the sealed block whole.
 
 The in-progress block is not necessarily the highest-numbered block, so block numbers are always sent explicitly.
 
@@ -134,7 +138,7 @@ The in-progress block is not necessarily the highest-numbered block, so block nu
 - On startup, truncate the data file to the last committed `endOffset`; anything beyond it is an uncommitted tail. A torn last journal line is invalid and ignored.
 - The per-device marks live in the server's journal and checkpoint, not in the log entries and not on clients.
 - Sealing and adoption: write the file to a temp name, `fsync`, rename, then journal a record. Recovery deletes leftover temp files and redoes unfinished seals.
-- Checkpoint / compaction: write the new checkpoint (per-device marks, last committed offset, manifest pointer) to a temp file, `fsync`, `rename` over the old one, `fsync` the directory. Never overwrite in place. The journal after the checkpoint is what recovery replays.
+- Checkpoint / compaction: write the new checkpoint (per-device marks, last committed offset) to a temp file, `fsync`, `rename` over the old one, `fsync` the directory. Never overwrite in place. The journal after the checkpoint is what recovery replays.
 - Alternative if this becomes too fiddly: run the server on SQLite (WAL mode) so entry insert and mark update are one transaction, and generate block files from it.
 
 ### Single-device mode (v1, no server)
@@ -174,7 +178,7 @@ Based on a quick search, not a full study:
 - Sealed blocks are immutable and cached on clients, and they bake in the sort order and event schema. Fixing a bad entry, deleting history, or changing the schema means a block rewrite plus client cache invalidation (the block version number exists for this).
 - The server owns block numbering and adoption. Server backups matter. Clients still hold full copies of the events.
 - Every line carries a device id (about 14 bytes with its key and quotes).
-- More moving parts than a plain per-device log: two logs per client, manifests, block-based cursor, server journal.
+- More moving parts than a plain per-device log: two logs per client, an index cache, block-based cursor, server journal.
 - Many small files: about 73 sealed blocks a year per log at 200 reviews a day.
 - Up to ~5 recent reviews can be lost if the app dies before a flush (see Undo).
 
@@ -183,7 +187,7 @@ Based on a quick search, not a full study:
 1. Final event schema and versioning.
 2. Dedup rules for near-duplicate reviews from multiple devices (Anki unions history but keeps last-write-wins card state; we derive state from the log and would double-count). Options: ignore a review of a card within N seconds of another, or a server-chosen winner per card.
 3. Handling devices with badly wrong clocks (a clock far in the future would sort a device's reviews after everything else, and the monotonic rule would keep them there).
-4. How a client verifies and recovers if its blocks diverge from the server's (manifest hash check, re-fetch).
+4. How a client verifies and recovers if its blocks diverge from the server's (block hash check against the server's, re-fetch).
 5. First-sync reconciliation when a device has local history and the server already has other devices' data.
 6. Whether and when to gzip sealed blocks.
 7. Whether ranged reads (Obsidian API, or `fetch` + `Range` on `getResourcePath`, unverified on iOS) change any of this.

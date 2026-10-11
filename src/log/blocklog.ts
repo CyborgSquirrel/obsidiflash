@@ -11,7 +11,9 @@ import { hashText } from "./hash";
 import { writeAtomic, type Storage } from "./storage";
 
 export const DEFAULT_BLOCK_SIZE = 1000;
+const FORMAT_VERSION = "1";
 
+/** Derived facts about a sealed block. Rebuildable from the block file. */
 export interface BlockInfo {
   number: number;
   count: number;
@@ -20,19 +22,8 @@ export interface BlockInfo {
   hash: string;
 }
 
-export interface Manifest {
-  version: 1;
-  blockSize: number;
-  /** Next block number to hand out. */
-  nextBlock: number;
-  /** Number of the in-progress block. Not necessarily the highest block number. */
-  openBlock: number;
-  /** Sealed blocks, ascending by number. */
-  sealed: BlockInfo[];
-}
-
 export interface BlockLogOptions {
-  /** Entries per block for a new log. An existing log keeps the size in its manifest. */
+  /** Entries per block. Not stored: sealed blocks stay valid if this changes. */
   blockSize?: number;
 }
 
@@ -44,26 +35,41 @@ function parseBlockNumber(name: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
-function isManifest(value: unknown): value is Manifest {
+/** `sorted` must be sorted by `(t, d)`; `text` is its encoded form. */
+function infoOf(number: number, sorted: readonly ReviewEvent[], text: string): BlockInfo {
+  return {
+    number,
+    count: sorted.length,
+    minT: sorted.length > 0 ? sorted[0]!.t : 0,
+    maxT: sorted.length > 0 ? sorted[sorted.length - 1]!.t : 0,
+    hash: hashText(text),
+  };
+}
+
+function isBlockInfo(value: unknown, number: number): value is BlockInfo {
   if (typeof value !== "object" || value === null) return false;
   const o = value as Record<string, unknown>;
   return (
-    o.version === 1 &&
-    Number.isInteger(o.blockSize) &&
-    Number.isInteger(o.nextBlock) &&
-    Number.isInteger(o.openBlock) &&
-    Array.isArray(o.sealed)
+    o.number === number &&
+    Number.isSafeInteger(o.count) &&
+    Number.isSafeInteger(o.minT) &&
+    Number.isSafeInteger(o.maxT) &&
+    typeof o.hash === "string"
   );
 }
 
 /**
  * An append-only log of review events, stored as numbered blocks in a directory.
  *
- * Sealed blocks are immutable and sorted by `(t, d)`. One in-progress block holds
- * entries in arrival order and is sealed when it reaches `blockSize` entries.
+ * The directory is the source of truth. A sealed block exists once its file has been
+ * renamed into place, which is atomic. Sealed blocks are immutable and sorted by `(t, d)`.
+ * At most one in-progress block holds entries in arrival order; it is sealed when it
+ * reaches `blockSize` entries. Block numbers are never reused, and the in-progress block
+ * keeps its number even if whole blocks are adopted after it.
  *
  * Layout under `dir`:
- *   manifest.json
+ *   VERSION               format version
+ *   index.json            optional cache of per-block info; safe to delete
  *   open/NNNNNN.jsonl     the in-progress block (arrival order)
  *   sealed/NNNNNN.jsonl   sealed blocks (sorted)
  */
@@ -73,7 +79,9 @@ export class BlockLog {
   private constructor(
     private readonly storage: Storage,
     private readonly dir: string,
-    private manifest: Manifest,
+    private readonly blockSize: number,
+    private readonly sealed: Map<number, BlockInfo>,
+    private openNumber: number | null,
     private open: ReviewEvent[],
   ) {}
 
@@ -82,64 +90,115 @@ export class BlockLog {
     dir: string,
     options: BlockLogOptions = {},
   ): Promise<BlockLog> {
+    const blockSize = options.blockSize ?? DEFAULT_BLOCK_SIZE;
     await storage.mkdir(`${dir}/sealed`);
     await storage.mkdir(`${dir}/open`);
 
-    const manifestPath = `${dir}/manifest.json`;
-    const raw = await storage.read(manifestPath);
-    let manifest: Manifest;
-    if (raw === null) {
-      manifest = {
-        version: 1,
-        blockSize: options.blockSize ?? DEFAULT_BLOCK_SIZE,
-        nextBlock: 2,
-        openBlock: 1,
-        sealed: [],
-      };
-      await writeAtomic(storage, manifestPath, JSON.stringify(manifest));
-    } else {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        throw new Error(`corrupt manifest: ${manifestPath}`);
+    // Leftovers of interrupted atomic writes.
+    for (const d of [dir, `${dir}/sealed`, `${dir}/open`]) {
+      for (const name of await storage.list(d)) {
+        if (name.endsWith(".tmp")) await storage.remove(`${d}/${name}`);
       }
-      if (!isManifest(parsed)) throw new Error(`unsupported manifest: ${manifestPath}`);
-      manifest = parsed;
     }
 
-    await BlockLog.recover(storage, dir, manifest);
-
-    const openPath = `${dir}/open/${pad(manifest.openBlock)}.jsonl`;
-    const text = (await storage.read(openPath)) ?? "";
-    if (text !== "" && !text.endsWith("\n")) {
-      // Torn last line: rewrite the open block trimmed to its last newline.
-      await writeAtomic(storage, openPath, trimToLastNewline(text));
+    const versionPath = `${dir}/VERSION`;
+    const version = await storage.read(versionPath);
+    if (version === null) await writeAtomic(storage, versionPath, FORMAT_VERSION + "\n");
+    else if (version.trim() !== FORMAT_VERSION) {
+      throw new Error(`unsupported log format version "${version.trim()}" in ${dir}`);
     }
-    const open = parseEvents((await storage.read(openPath)) ?? "");
 
-    const log = new BlockLog(storage, dir, manifest, open);
-    if (open.length >= manifest.blockSize) await log.run(() => log.sealOpen());
+    const sealedNumbers: number[] = [];
+    for (const name of await storage.list(`${dir}/sealed`)) {
+      const n = parseBlockNumber(name);
+      if (n !== null) sealedNumbers.push(n);
+    }
+    sealedNumbers.sort((a, b) => a - b);
+    const sealedSet = new Set(sealedNumbers);
+
+    // An open file whose block is already sealed is stale (a seal was interrupted
+    // after the rename but before the open file was removed).
+    const openNumbers: number[] = [];
+    for (const name of await storage.list(`${dir}/open`)) {
+      const n = parseBlockNumber(name);
+      if (n === null) continue;
+      if (sealedSet.has(n)) await storage.remove(`${dir}/open/${name}`);
+      else openNumbers.push(n);
+    }
+    if (openNumbers.length > 1) {
+      throw new Error(`more than one in-progress block in ${dir}: ${openNumbers.join(", ")}`);
+    }
+    const openNumber = openNumbers[0] ?? null;
+
+    let open: ReviewEvent[] = [];
+    if (openNumber !== null) {
+      const path = `${dir}/open/${pad(openNumber)}.jsonl`;
+      const text = (await storage.read(path)) ?? "";
+      if (text !== "" && !text.endsWith("\n")) {
+        // Torn last line: rewrite the open block trimmed to its last newline.
+        await writeAtomic(storage, path, trimToLastNewline(text));
+      }
+      open = parseEvents((await storage.read(path)) ?? "");
+    }
+
+    const sealed = await BlockLog.loadInfos(storage, dir, sealedNumbers);
+    const log = new BlockLog(storage, dir, blockSize, sealed, openNumber, open);
+    if (open.length >= blockSize) await log.run(() => log.sealOpen());
     return log;
   }
 
-  /** Remove leftovers of interrupted operations. */
-  private static async recover(storage: Storage, dir: string, manifest: Manifest): Promise<void> {
-    for (const name of await storage.list(dir)) {
-      if (name.endsWith(".tmp")) await storage.remove(`${dir}/${name}`);
+  /** Per-block info from the cache where valid, recomputed from the block files otherwise. */
+  private static async loadInfos(
+    storage: Storage,
+    dir: string,
+    numbers: readonly number[],
+  ): Promise<Map<number, BlockInfo>> {
+    const cached = await BlockLog.readIndex(storage, dir);
+    const infos = new Map<number, BlockInfo>();
+    let changed = false;
+    for (const n of numbers) {
+      const hit = cached.get(n);
+      if (hit) {
+        infos.set(n, hit);
+        continue;
+      }
+      const text = await storage.read(`${dir}/sealed/${pad(n)}.jsonl`);
+      if (text === null) continue;
+      infos.set(n, infoOf(n, parseEvents(text), text));
+      changed = true;
     }
-    const sealedNumbers = new Set(manifest.sealed.map((b) => b.number));
-    for (const name of await storage.list(`${dir}/sealed`)) {
-      const n = parseBlockNumber(name);
-      // A sealed file the manifest does not list never committed; its data is still
-      // in the open block (seal) or will be re-sent (adopt).
-      if (n === null || !sealedNumbers.has(n)) await storage.remove(`${dir}/sealed/${name}`);
+    for (const n of cached.keys()) if (!infos.has(n)) changed = true;
+    if (changed) await BlockLog.writeIndex(storage, dir, infos);
+    return infos;
+  }
+
+  private static async readIndex(storage: Storage, dir: string): Promise<Map<number, BlockInfo>> {
+    const out = new Map<number, BlockInfo>();
+    const raw = await storage.read(`${dir}/index.json`);
+    if (raw === null) return out;
+    try {
+      const parsed = JSON.parse(raw) as { version?: unknown; blocks?: unknown };
+      if (parsed.version !== 1 || typeof parsed.blocks !== "object" || parsed.blocks === null) {
+        return out;
+      }
+      for (const [key, value] of Object.entries(parsed.blocks)) {
+        const n = Number(key);
+        if (Number.isSafeInteger(n) && isBlockInfo(value, n)) out.set(n, value);
+      }
+    } catch {
+      // A bad cache is just a missing cache.
     }
-    for (const name of await storage.list(`${dir}/open`)) {
-      const n = parseBlockNumber(name);
-      // Stale open file of a block that was sealed, or a leftover temp file.
-      if (n === null || n !== manifest.openBlock) await storage.remove(`${dir}/open/${name}`);
-    }
+    return out;
+  }
+
+  private static async writeIndex(
+    storage: Storage,
+    dir: string,
+    infos: ReadonlyMap<number, BlockInfo>,
+  ): Promise<void> {
+    const blocks: Record<string, BlockInfo> = {};
+    for (const [n, info] of infos) blocks[String(n)] = info;
+    await writeAtomic(storage, `${dir}/index.json`, JSON.stringify({ version: 1, blocks }));
   }
 
   private run<T>(fn: () => Promise<T>): Promise<T> {
@@ -148,40 +207,32 @@ export class BlockLog {
     return result;
   }
 
-  private openPath(): string {
-    return `${this.dir}/open/${pad(this.manifest.openBlock)}.jsonl`;
+  private nextNumber(): number {
+    let max = this.openNumber ?? 0;
+    for (const n of this.sealed.keys()) if (n > max) max = n;
+    return max + 1;
+  }
+
+  private openPath(n: number): string {
+    return `${this.dir}/open/${pad(n)}.jsonl`;
   }
 
   private sealedPath(n: number): string {
     return `${this.dir}/sealed/${pad(n)}.jsonl`;
   }
 
-  private async writeManifest(next: Manifest): Promise<void> {
-    await writeAtomic(this.storage, `${this.dir}/manifest.json`, JSON.stringify(next));
-    this.manifest = next;
-  }
-
   private async sealOpen(): Promise<void> {
-    const n = this.manifest.openBlock;
+    const n = this.openNumber;
+    if (n === null) return;
     const sorted = [...this.open].sort(compareEvents);
     const text = encodeEvents(sorted);
+    // Renaming the file into place is the commit.
     await writeAtomic(this.storage, this.sealedPath(n), text);
-    const info: BlockInfo = {
-      number: n,
-      count: sorted.length,
-      minT: sorted[0]!.t,
-      maxT: sorted[sorted.length - 1]!.t,
-      hash: hashText(text),
-    };
-    const oldOpenPath = this.openPath();
-    await this.writeManifest({
-      ...this.manifest,
-      sealed: [...this.manifest.sealed, info].sort((a, b) => a.number - b.number),
-      openBlock: this.manifest.nextBlock,
-      nextBlock: this.manifest.nextBlock + 1,
-    });
+    this.sealed.set(n, infoOf(n, sorted, text));
     this.open = [];
-    await this.storage.remove(oldOpenPath);
+    this.openNumber = null;
+    await this.storage.remove(this.openPath(n));
+    await BlockLog.writeIndex(this.storage, this.dir, this.sealed);
   }
 
   /** Append one event. Durable once the returned promise resolves. */
@@ -193,9 +244,10 @@ export class BlockLog {
     return this.run(async () => {
       for (const e of events) {
         if (!isReviewEvent(e)) throw new Error("invalid review event");
-        await this.storage.append(this.openPath(), encodeEvent(e) + "\n");
+        if (this.openNumber === null) this.openNumber = this.nextNumber();
+        await this.storage.append(this.openPath(this.openNumber), encodeEvent(e) + "\n");
         this.open.push(e);
-        if (this.open.length >= this.manifest.blockSize) await this.sealOpen();
+        if (this.open.length >= this.blockSize) await this.sealOpen();
       }
     });
   }
@@ -203,7 +255,7 @@ export class BlockLog {
   /**
    * Add a whole, already sealed block, giving it the next free block number.
    * The events must be strictly ascending by `(t, d)`. The in-progress block keeps
-   * its number. Returns the new block's manifest entry.
+   * its number. Returns the new block's info.
    */
   adoptSealedBlock(events: readonly ReviewEvent[]): Promise<BlockInfo> {
     return this.run(async () => {
@@ -215,27 +267,24 @@ export class BlockLog {
           throw new Error("block is not strictly ascending by (t, d)");
         }
       }
-      const n = this.manifest.nextBlock;
+      const n = this.nextNumber();
       const text = encodeEvents(events);
       await writeAtomic(this.storage, this.sealedPath(n), text);
-      const info: BlockInfo = {
-        number: n,
-        count: events.length,
-        minT: events[0]!.t,
-        maxT: events[events.length - 1]!.t,
-        hash: hashText(text),
-      };
-      await this.writeManifest({
-        ...this.manifest,
-        sealed: [...this.manifest.sealed, info].sort((a, b) => a.number - b.number),
-        nextBlock: n + 1,
-      });
+      const info = infoOf(n, events, text);
+      this.sealed.set(n, info);
+      await BlockLog.writeIndex(this.storage, this.dir, this.sealed);
       return info;
     });
   }
 
-  getManifest(): Manifest {
-    return { ...this.manifest, sealed: this.manifest.sealed.map((b) => ({ ...b })) };
+  /** Sealed blocks, ascending by number. */
+  blocks(): BlockInfo[] {
+    return [...this.sealed.values()].sort((a, b) => a.number - b.number).map((b) => ({ ...b }));
+  }
+
+  /** Number of the in-progress block, or null if there is none yet. */
+  openBlockNumber(): number | null {
+    return this.openNumber;
   }
 
   /** Events of the in-progress block, in arrival order. */
@@ -245,9 +294,7 @@ export class BlockLog {
 
   /** Events of a sealed block, sorted by `(t, d)`. */
   async readSealed(number: number): Promise<ReviewEvent[]> {
-    const text = await this.storage.read(this.sealedPath(number));
-    if (text === null) throw new Error(`no sealed block ${number}`);
-    return parseEvents(text);
+    return parseEvents(await this.readSealedText(number));
   }
 
   /** The raw text of a sealed block, as stored. */
@@ -260,7 +307,7 @@ export class BlockLog {
   /** Every block as an array sorted by `(t, d)`, ready for `mergeSorted`. */
   async sortedSources(): Promise<ReviewEvent[][]> {
     const sources: ReviewEvent[][] = [];
-    for (const b of this.manifest.sealed) sources.push(await this.readSealed(b.number));
+    for (const b of this.blocks()) sources.push(await this.readSealed(b.number));
     if (this.open.length > 0) sources.push([...this.open].sort(compareEvents));
     return sources;
   }
@@ -268,7 +315,7 @@ export class BlockLog {
   /** The largest timestamp in the log, or 0 if it is empty. */
   maxT(): number {
     let max = 0;
-    for (const b of this.manifest.sealed) if (b.maxT > max) max = b.maxT;
+    for (const b of this.sealed.values()) if (b.maxT > max) max = b.maxT;
     for (const e of this.open) if (e.t > max) max = e.t;
     return max;
   }
