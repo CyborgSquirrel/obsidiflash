@@ -110,7 +110,7 @@ Names are placeholders. Sealed blocks may later be gzipped (see `storage-notes.m
 
 - **Whole sealed blocks:** the server verifies the block (valid lines, sorted by `(t, d)`, strictly increasing `t` per device, `t` above the device's mark, hash) and adopts it, giving it the next free block number. No sorting or renumbering is needed because the lines contain nothing the server assigns. The client keeps its own copy as the mirror block, so it does not download its own upload back.
 - **Loose entries:** appended to the server's in-progress block, which seals at 1,000 entries and is sorted then.
-- **Marks:** the server keeps the last `t` received per device. Entries at or below the mark are accepted only as an exact repeat of a batch it already committed (same block hash for blocks; same first `t`, last `t` and count for loose entries), which makes retries after a lost response safe. Anything else is a device-id error: the server rejects it and the client gets a "reset device id" option. Reset generates a new id, re-stamps the unsynced local entries with it (keeping `t`), and drops the retained old-id newest entry instead of rewriting it, so no review is counted twice.
+- **Marks:** the server keeps the last `t` received per device. Entries with `t` at or below the mark are dropped. This makes retries safe: a retry of a batch the server already committed is dropped whole, and a retry that was extended with newer entries (the client kept reviewing while the first response was lost) has its old part dropped and its new part appended. Each sync request also carries the client's newest own `t` (`last`). A healthy client's `last` is never below the mark, because cleanup keeps its newest entry. If it is, the device's data is behind what the server holds under this id (restored from an old backup, or two devices sharing an id), and the server answers with a device-id error instead of dropping silently. The client then offers to reset the device id: generate a new id, re-stamp the unsynced local entries with it (keeping `t`), and drop the retained old-id newest entry instead of rewriting it, so no review is counted twice. This does not catch a second device that shares an id and is ahead of the mark; with random 32-bit ids that is very unlikely.
 - This mirrors Raft's client-request deduplication (the state machine remembers the latest applied per client).
 
 ### Pull cursor
@@ -133,7 +133,7 @@ The in-progress block is not necessarily the highest-numbered block, so block nu
 ### Server crash safety (WAL / commit journal)
 
 - Append entries (or write the adopted block) to the data file and `fsync`.
-- Append one journal record and `fsync` it; the record is the commit point: `device, first t, last t, count or block number and hash, file, endOffset`.
+- Append one journal record and `fsync` it; the record is the commit point: `device, new mark (last t), count or block number and hash, file, endOffset`.
 - Only then acknowledge the client.
 - On startup, truncate the data file to the last committed `endOffset`; anything beyond it is an uncommitted tail. A torn last journal line is invalid and ignored.
 - The per-device marks live in the server's journal and checkpoint, not in the log entries and not on clients.
