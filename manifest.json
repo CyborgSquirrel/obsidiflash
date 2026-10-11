@@ -1,0 +1,9 @@
+{
+  "id": "obsiflash",
+  "name": "Obsiflash",
+  "version": "0.0.1",
+  "minAppVersion": "1.12.3",
+  "description": "Anki-style spaced repetition flashcards with FSRS scheduling.",
+  "author": "Jardan Andrei",
+  "isDesktopOnly": false
+}
