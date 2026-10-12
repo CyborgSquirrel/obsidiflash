@@ -133,12 +133,13 @@ export class BlockLog {
     let open: ReviewEvent[] = [];
     if (openNumber !== null) {
       const path = `${dir}/open/${pad(openNumber)}.jsonl`;
-      const text = (await storage.read(path)) ?? "";
+      let text = (await storage.read(path)) ?? "";
       if (text !== "" && !text.endsWith("\n")) {
         // Torn last line: rewrite the open block trimmed to its last newline.
-        await writeAtomic(storage, path, trimToLastNewline(text));
+        text = trimToLastNewline(text)
+        await writeAtomic(storage, path, text);
       }
-      open = parseEvents((await storage.read(path)) ?? "");
+      open = parseEvents(text);
     }
 
     const sealed = await BlockLog.loadInfos(storage, dir, sealedNumbers);
