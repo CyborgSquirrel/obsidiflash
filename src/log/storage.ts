@@ -5,6 +5,8 @@
 export interface Storage {
   /** File contents, or null if the file does not exist. */
   read(path: string): Promise<string | null>;
+  /** Whether a file exists at this path. */
+  exists(path: string): Promise<boolean>;
   /** Create or replace a whole file. */
   write(path: string, data: string): Promise<void>;
   /** Append to a file, creating it if needed. */
@@ -32,6 +34,10 @@ export class MemoryStorage implements Storage {
 
   async read(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
+  }
+
+  async exists(path: string): Promise<boolean> {
+    return this.files.has(path);
   }
 
   async write(path: string, data: string): Promise<void> {

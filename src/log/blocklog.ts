@@ -8,7 +8,6 @@ import {
   type ReviewEvent,
 } from "./event";
 import { writeAtomic, type Storage } from "./storage";
-import * as itt from "iter-tools";
 
 export const DEFAULT_BLOCK_SIZE = 1000;
 const FORMAT_VERSION = "1";
@@ -44,12 +43,17 @@ type BlockId = number;
 export class BlockLog {
   private queue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Set when a storage write failed, so the open file may hold a torn fragment that
+   * memory does not know about. Nothing is appended until the file has been rewritten
+   * from memory, because a new line glued onto the fragment would be lost.
+   */
+  private needsRepair = false;
+
   private constructor(
     private readonly storage: Storage,
     private readonly dir: string,
     private readonly blockSize: number,
-
-    private readonly sealed: Set<BlockId>,
 
     private openBlockId: BlockId,
     private openBlock: ReviewEvent[],
@@ -61,6 +65,8 @@ export class BlockLog {
     options: BlockLogOptions = {},
   ): Promise<BlockLog> {
     const blockSize = options.blockSize ?? DEFAULT_BLOCK_SIZE;
+
+    await storage.mkdir(`${dir}`);
 
     // Figure out format version
     const versionPath = `${dir}/VERSION`;
@@ -80,50 +86,24 @@ export class BlockLog {
       }
     }
 
-    // Gather all sealed blocks
-    const sealedBlockIds: BlockId[] = [];
-    for (const name of await storage.list(`${dir}/sealed`)) {
-      const n = parseBlockNumber(name);
-      if (n === null) {
-        continue;
-      }
-
-      sealedBlockIds.push(n);
-    }
-    const sealedSet = new Set(sealedBlockIds);
-
-    // Gather all open blocks
-    const openBlockIds: BlockId[] = [];
-    for (const name of await storage.list(`${dir}/open`)) {
-      const n = parseBlockNumber(name);
-      if (n === null) {
-        continue;
-      }
-
-      // Clean up this block if it has been sealed already
-      if (sealedSet.has(n)) {
-        await storage.remove(`${dir}/open/${name}`);
-        continue;
-      }
-
-      openBlockIds.push(n);
-    }
-    if (openBlockIds.length > 1) {
-      throw new Error(`more than one in-progress block in ${dir}: ${openBlockIds.join(", ")}`);
-    }
-
-    let nextBlockId = itt.reduce(0, Math.max, itt.concat(sealedBlockIds, openBlockIds)) + 1;
-
-    // Continue/start an open block
+    // Run through all the blocks
     let openBlockId: BlockId;
     {
-      const first = openBlockIds[0];
-      if (first !== undefined) {
-        openBlockId = first;
-      } else {
-        openBlockId = nextBlockId;
-        nextBlockId += 1;
+      // One directory listing each, instead of an exists() call per block.
+      const sealedNames = new Set(await storage.list(`${dir}/sealed`));
+      const openNames = new Set(await storage.list(`${dir}/open`));
+
+      let blockId = 1;
+      while (sealedNames.has(`${pad(blockId)}.jsonl`)) {
+        // Remove open blocks which have been sealed
+        const openName = `${pad(blockId)}.jsonl`;
+        if (openNames.has(openName)) {
+          await storage.remove(`${dir}/open/${openName}`);
+        }
+
+        blockId += 1;
       }
+      openBlockId = blockId;
     }
 
     // Read the open block
@@ -139,7 +119,7 @@ export class BlockLog {
       open = parseEvents(text);
     }
 
-    const log = new BlockLog(storage, dir, blockSize, sealedSet, openBlockId, open);
+    const log = new BlockLog(storage, dir, blockSize, openBlockId, open);
 
     // Poke the log so that it seals stuff if it needs to
     await log.appendMany([]);
@@ -180,7 +160,7 @@ export class BlockLog {
           const text = encodeEvents(sealedBlock);
           // Renaming the file into place is the commit.
           await writeAtomic(this.storage, this.sealedPath(id), text);
-          this.sealed.add(id);
+          this.needsRepair = false; // the old open file is obsolete now
           this.openBlock = [];
           this.openBlockId += 1;
           await this.storage.remove(this.openPath(id));
@@ -195,19 +175,27 @@ export class BlockLog {
         ei += 1
 
         if (!isReviewEvent(e)) throw new Error("invalid review event");
-        await this.storage.append(this.openPath(this.openBlockId), encodeEvent(e) + "\n");
+        const path = this.openPath(this.openBlockId);
+        try {
+          if (this.needsRepair) {
+            // Memory holds every acknowledged event; make the file match it again.
+            await writeAtomic(this.storage, path, encodeEvents(this.openBlock));
+            this.needsRepair = false;
+          }
+          await this.storage.append(path, encodeEvent(e) + "\n");
+        } catch (err) {
+          // If we get here the append (or the repair) may have left a fragment.
+          // Refuse to write anything else until a repair succeeds.
+          this.needsRepair = true;
+          throw err;
+        }
         this.openBlock.push(e);
       }
     });
   }
 
-  /** Numbers of the sealed blocks, ascending. */
-  blocks(): number[] {
-    return [...this.sealed].sort((a, b) => a - b);
-  }
-
   /** Number of the in-progress block, or null if there is none yet. */
-  openBlockNumber(): number | null {
+  openBlockNumber(): number {
     return this.openBlockId;
   }
 
@@ -230,9 +218,12 @@ export class BlockLog {
 
   /** Every block as an array sorted by `(t, d)`, ready for `mergeSorted`. */
   async sortedSources(): Promise<ReviewEvent[][]> {
+    const openBlockId = this.openBlockId;
+    const openBlock = [...this.openBlock];
+
     const sources: ReviewEvent[][] = [];
-    for (const n of this.blocks()) sources.push(await this.readSealed(n));
-    if (this.openBlock.length > 0) sources.push([...this.openBlock].sort(compareEvents));
+    for (let n = 1; n < openBlockId; ++n) sources.push(await this.readSealed(n));
+    if (openBlock.length > 0) sources.push(openBlock.sort(compareEvents));
     return sources;
   }
 
@@ -247,8 +238,8 @@ export class BlockLog {
       for (const e of this.openBlock) if (e.t > max) max = e.t;
       return max;
     }
-    const newest = this.blocks().pop();
-    if (newest === undefined) return 0;
+    const newest = this.openBlockId - 1;
+    if (newest < 1) return 0;
     const events = await this.readSealed(newest); // sorted, so the last has the largest t
     return events.length > 0 ? events[events.length - 1]!.t : 0;
   }

@@ -55,3 +55,46 @@ export class CrashingStorage extends MemoryStorage {
     return s;
   }
 }
+
+/** Storage whose reads take real time, so other operations can run in between. */
+export class SlowReadStorage extends MemoryStorage {
+  delayMs = 0;
+
+  override async read(path: string): Promise<string | null> {
+    if (this.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return super.read(path);
+  }
+}
+
+/**
+ * Storage with controllable failures. A failing append first writes a fragment of its
+ * data, like a disk-full error halfway through a write; a failing write changes nothing.
+ */
+export class FlakyStorage extends MemoryStorage {
+  failAppends = 0;
+  failWrites = 0;
+
+  /** A healthy copy of the current files, as after a restart. */
+  clone(): MemoryStorage {
+    const copy = new MemoryStorage();
+    for (const [k, v] of this.files) copy.files.set(k, v);
+    return copy;
+  }
+
+  override async append(path: string, data: string): Promise<void> {
+    if (this.failAppends > 0) {
+      this.failAppends--;
+      await super.append(path, data.slice(0, 8));
+      throw new Error("append failed");
+    }
+    return super.append(path, data);
+  }
+
+  override async write(path: string, data: string): Promise<void> {
+    if (this.failWrites > 0) {
+      this.failWrites--;
+      throw new Error("write failed");
+    }
+    return super.write(path, data);
+  }
+}
