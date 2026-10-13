@@ -13,7 +13,7 @@ describe("BlockLog", () => {
   it("starts empty", async () => {
     const log = await BlockLog.open(new MemoryStorage(), "log", { blockSize: 4 });
     expect(log.blocks()).toEqual([]);
-    expect(log.openBlockNumber()).toBeNull();
+    expect(log.openBlockNumber()).toBe(1);
     expect(log.openEvents()).toEqual([]);
     expect(await log.lastT()).toBe(0);
     expect(await all(log)).toEqual([]);
@@ -30,7 +30,7 @@ describe("BlockLog", () => {
 
     await log.append(inputs[3]!);
     expect(log.blocks()).toEqual([1]);
-    expect(log.openBlockNumber()).toBeNull();
+    expect(log.openBlockNumber()).toBe(2);
     expect(log.openEvents()).toEqual([]);
     expect(await log.readSealed(1)).toEqual([...inputs].sort(compareEvents));
 
@@ -109,7 +109,7 @@ describe("BlockLog", () => {
       storage.files.set("log/sealed/000002.jsonl.tmp", "garbage");
 
       const b = await BlockLog.open(storage, "log", { blockSize: 2 });
-      expect(b.openBlockNumber()).toBeNull();
+      expect(b.openBlockNumber()).toBe(2);
       expect([...storage.files.keys()].sort()).toEqual(["log/VERSION", "log/sealed/000001.jsonl"]);
       expect(await all(b)).toEqual([ev(1), ev(2)]);
     });

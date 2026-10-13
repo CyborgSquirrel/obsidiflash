@@ -8,6 +8,7 @@ import {
   type ReviewEvent,
 } from "./event";
 import { writeAtomic, type Storage } from "./storage";
+import * as itt from "iter-tools";
 
 export const DEFAULT_BLOCK_SIZE = 1000;
 const FORMAT_VERSION = "1";
@@ -24,6 +25,8 @@ function parseBlockNumber(name: string): number | null {
   const m = BLOCK_FILE_RE.exec(name);
   return m ? Number(m[1]) : null;
 }
+
+type BlockId = number;
 
 /**
  * An append-only log of review events, stored as numbered blocks in a directory.
@@ -45,9 +48,11 @@ export class BlockLog {
     private readonly storage: Storage,
     private readonly dir: string,
     private readonly blockSize: number,
-    private readonly sealed: Set<number>,
-    private openNumber: number | null,
-    private open: ReviewEvent[],
+
+    private readonly sealed: Set<BlockId>,
+
+    private openBlockId: BlockId,
+    private openBlock: ReviewEvent[],
   ) {}
 
   static async open(
@@ -56,6 +61,15 @@ export class BlockLog {
     options: BlockLogOptions = {},
   ): Promise<BlockLog> {
     const blockSize = options.blockSize ?? DEFAULT_BLOCK_SIZE;
+
+    // Figure out format version
+    const versionPath = `${dir}/VERSION`;
+    const version = await storage.read(versionPath);
+    if (version === null) await writeAtomic(storage, versionPath, FORMAT_VERSION + "\n");
+    else if (version.trim() !== FORMAT_VERSION) {
+      throw new Error(`unsupported log format version "${version.trim()}" in ${dir}`);
+    }
+
     await storage.mkdir(`${dir}/sealed`);
     await storage.mkdir(`${dir}/open`);
 
@@ -66,37 +80,56 @@ export class BlockLog {
       }
     }
 
-    const versionPath = `${dir}/VERSION`;
-    const version = await storage.read(versionPath);
-    if (version === null) await writeAtomic(storage, versionPath, FORMAT_VERSION + "\n");
-    else if (version.trim() !== FORMAT_VERSION) {
-      throw new Error(`unsupported log format version "${version.trim()}" in ${dir}`);
-    }
-
-    const sealedNumbers: number[] = [];
+    // Gather all sealed blocks
+    const sealedBlockIds: BlockId[] = [];
     for (const name of await storage.list(`${dir}/sealed`)) {
       const n = parseBlockNumber(name);
-      if (n !== null) sealedNumbers.push(n);
-    }
-    const sealedSet = new Set(sealedNumbers);
+      if (n === null) {
+        continue;
+      }
 
-    // An open file whose block is already sealed is stale (a seal was interrupted
-    // after the rename but before the open file was removed).
-    const openNumbers: number[] = [];
+      sealedBlockIds.push(n);
+    }
+    const sealedSet = new Set(sealedBlockIds);
+
+    // Gather all open blocks
+    const openBlockIds: BlockId[] = [];
     for (const name of await storage.list(`${dir}/open`)) {
       const n = parseBlockNumber(name);
-      if (n === null) continue;
-      if (sealedSet.has(n)) await storage.remove(`${dir}/open/${name}`);
-      else openNumbers.push(n);
-    }
-    if (openNumbers.length > 1) {
-      throw new Error(`more than one in-progress block in ${dir}: ${openNumbers.join(", ")}`);
-    }
-    const openNumber = openNumbers[0] ?? null;
+      if (n === null) {
+        continue;
+      }
 
+      // Clean up this block if it has been sealed already
+      if (sealedSet.has(n)) {
+        await storage.remove(`${dir}/open/${name}`);
+        continue;
+      }
+
+      openBlockIds.push(n);
+    }
+    if (openBlockIds.length > 1) {
+      throw new Error(`more than one in-progress block in ${dir}: ${openBlockIds.join(", ")}`);
+    }
+
+    let nextBlockId = itt.reduce(0, Math.max, itt.concat(sealedBlockIds, openBlockIds)) + 1;
+
+    // Continue/start an open block
+    let openBlockId: BlockId;
+    {
+      const first = openBlockIds[0];
+      if (first !== undefined) {
+        openBlockId = first;
+      } else {
+        openBlockId = nextBlockId;
+        nextBlockId += 1;
+      }
+    }
+
+    // Read the open block
     let open: ReviewEvent[] = [];
-    if (openNumber !== null) {
-      const path = `${dir}/open/${pad(openNumber)}.jsonl`;
+    {
+      const path = `${dir}/open/${pad(openBlockId)}.jsonl`;
       let text = (await storage.read(path)) ?? "";
       if (text !== "" && !text.endsWith("\n")) {
         // Torn last line: rewrite the open block trimmed to its last newline.
@@ -106,8 +139,11 @@ export class BlockLog {
       open = parseEvents(text);
     }
 
-    const log = new BlockLog(storage, dir, blockSize, sealedSet, openNumber, open);
-    if (open.length >= blockSize) await log.run(() => log.sealOpen());
+    const log = new BlockLog(storage, dir, blockSize, sealedSet, openBlockId, open);
+
+    // Poke the log so that it seals stuff if it needs to
+    await log.appendMany([]);
+
     return log;
   }
 
@@ -115,12 +151,6 @@ export class BlockLog {
     const result = this.queue.then(fn);
     this.queue = result.catch(() => undefined);
     return result;
-  }
-
-  private nextNumber(): number {
-    let max = this.openNumber ?? 0;
-    for (const n of this.sealed) if (n > max) max = n;
-    return max + 1;
   }
 
   private openPath(n: number): string {
@@ -131,20 +161,6 @@ export class BlockLog {
     return `${this.dir}/sealed/${pad(n)}.jsonl`;
   }
 
-  private async sealOpen(): Promise<void> {
-    const n = this.openNumber;
-    if (n === null) return;
-
-    const sorted = [...this.open].sort(compareEvents);
-    const text = encodeEvents(sorted);
-    // Renaming the file into place is the commit.
-    await writeAtomic(this.storage, this.sealedPath(n), text);
-    this.sealed.add(n);
-    this.open = [];
-    this.openNumber = null;
-    await this.storage.remove(this.openPath(n));
-  }
-
   /** Append one event. Durable once the returned promise resolves. */
   append(event: ReviewEvent): Promise<void> {
     return this.appendMany([event]);
@@ -152,12 +168,35 @@ export class BlockLog {
 
   appendMany(events: readonly ReviewEvent[]): Promise<void> {
     return this.run(async () => {
-      for (const e of events) {
+      let ei = 0;
+      while (true) {
+        if (this.openBlock.length >= this.blockSize) {
+          if (this.openBlock.length > this.blockSize) {
+            // TODO: log error message
+          }
+
+          const id = this.openBlockId;
+          const sealedBlock = [...this.openBlock].sort(compareEvents);
+          const text = encodeEvents(sealedBlock);
+          // Renaming the file into place is the commit.
+          await writeAtomic(this.storage, this.sealedPath(id), text);
+          this.sealed.add(id);
+          this.openBlock = [];
+          this.openBlockId += 1;
+          await this.storage.remove(this.openPath(id));
+
+          continue;
+        }
+
+        if (ei >= events.length) {
+          break;
+        }
+        const e = events[ei];
+        ei += 1
+
         if (!isReviewEvent(e)) throw new Error("invalid review event");
-        if (this.openNumber === null) this.openNumber = this.nextNumber();
-        await this.storage.append(this.openPath(this.openNumber), encodeEvent(e) + "\n");
-        this.open.push(e);
-        if (this.open.length >= this.blockSize) await this.sealOpen();
+        await this.storage.append(this.openPath(this.openBlockId), encodeEvent(e) + "\n");
+        this.openBlock.push(e);
       }
     });
   }
@@ -169,12 +208,12 @@ export class BlockLog {
 
   /** Number of the in-progress block, or null if there is none yet. */
   openBlockNumber(): number | null {
-    return this.openNumber;
+    return this.openBlockId;
   }
 
   /** Events of the in-progress block, in arrival order. */
   openEvents(): ReviewEvent[] {
-    return [...this.open];
+    return [...this.openBlock];
   }
 
   /** Events of a sealed block, sorted by `(t, d)`. */
@@ -193,7 +232,7 @@ export class BlockLog {
   async sortedSources(): Promise<ReviewEvent[][]> {
     const sources: ReviewEvent[][] = [];
     for (const n of this.blocks()) sources.push(await this.readSealed(n));
-    if (this.open.length > 0) sources.push([...this.open].sort(compareEvents));
+    if (this.openBlock.length > 0) sources.push([...this.openBlock].sort(compareEvents));
     return sources;
   }
 
@@ -203,9 +242,9 @@ export class BlockLog {
    * one issued. Reads a sealed block only when the open block is empty.
    */
   async lastT(): Promise<number> {
-    if (this.open.length > 0) {
+    if (this.openBlock.length > 0) {
       let max = 0;
-      for (const e of this.open) if (e.t > max) max = e.t;
+      for (const e of this.openBlock) if (e.t > max) max = e.t;
       return max;
     }
     const newest = this.blocks().pop();
