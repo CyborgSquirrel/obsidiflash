@@ -9,9 +9,10 @@ function headingsOf(content: string): HeadingLike[] {
   const out: HeadingLike[] = [];
   let offset = 0;
   for (const line of content.split("\n")) {
-    const m = /^(#{1,6}) +\S/.exec(line);
+    const m = /^(#{1,6}) +(\S.*?)\s*$/.exec(line);
     if (m) {
       out.push({
+        heading: m[2]!,
         level: m[1]!.length,
         position: { start: { offset }, end: { offset: offset + line.replace(/\r$/, "").length } },
       });
@@ -24,15 +25,23 @@ function headingsOf(content: string): HeadingLike[] {
 const parse = (content: string) => sidesFromHeadings(content, headingsOf(content));
 
 describe("sidesFromHeadings", () => {
-  it("takes the body under the first and second H1 and hides the heading text", () => {
+  it("takes the body under the H1 named Front and the one named Back, hiding the heading text", () => {
     const card = parse(
       "---\ntags: [flashcard]\n---\n# Front\nWhat is the capital of France?\n\n# Back\nParis, on the Seine.\n",
     );
     expect(card).toEqual({ front: "What is the capital of France?", back: "Paris, on the Seine." });
   });
 
-  it("works without front matter and with CRLF line endings", () => {
-    expect(parse("# Q\r\nquestion\r\n# A\r\nanswer\r\n")).toEqual({ front: "question", back: "answer" });
+  it("goes by name, not position: order does not matter and other H1s are skipped", () => {
+    expect(parse("# Notes\nmine\n# Back\na\n# Front\nq\n# Extra\nignored")).toEqual({ front: "q", back: "a" });
+  });
+
+  it("ignores case and surrounding spaces in the names", () => {
+    expect(parse("# front \nq\n# BACK\na")).toEqual({ front: "q", back: "a" });
+  });
+
+  it("works with CRLF line endings", () => {
+    expect(parse("# Front\r\nquestion\r\n# Back\r\nanswer\r\n")).toEqual({ front: "question", back: "answer" });
   });
 
   it("keeps multi-line markdown, lists, and lower headings inside a side", () => {
@@ -41,21 +50,26 @@ describe("sidesFromHeadings", () => {
     expect(card?.back).toBe("**bold** answer\n\n![[img.png]]");
   });
 
-  it("ignores text before the first H1 and any H1 sections after the second", () => {
-    expect(parse("notes to self\n\n# Front\nq\n# Back\na\n# Extra\nignored")).toEqual({ front: "q", back: "a" });
+  it("ignores text before the first H1", () => {
+    expect(parse("notes to self\n\n# Front\nq\n# Back\na")).toEqual({ front: "q", back: "a" });
   });
 
-  it("ignores headings of other levels when picking the H1s", () => {
-    expect(parse("## not h1\n# Front\nq\n### deeper\n# Back\na")).toEqual({
+  it("uses the first of two H1s with the same name", () => {
+    expect(parse("# Front\nq1\n# Front\nq2\n# Back\na")).toEqual({ front: "q1", back: "a" });
+  });
+
+  it("ignores headings of other levels", () => {
+    expect(parse("## Front\nnope\n# Front\nq\n### deeper\n# Back\na")).toEqual({
       front: "q\n### deeper",
       back: "a",
     });
   });
 
-  it("returns null unless there are two non-empty sides", () => {
+  it("returns null unless Front and Back both exist and are non-empty", () => {
     expect(parse("")).toBeNull();
     expect(parse("just text")).toBeNull();
-    expect(parse("# Only front\nq")).toBeNull();
+    expect(parse("# Front\nq")).toBeNull();
+    expect(parse("# Q\nq\n# A\na")).toBeNull();
     expect(parse("# Front\n\n# Back\nanswer")).toBeNull();
     expect(parse("# Front\nq\n# Back\n   \n")).toBeNull();
   });
@@ -72,8 +86,8 @@ describe("sidesFromHeadings", () => {
     // Garbage offsets.
     expect(
       sidesFromHeadings(text, [
-        { level: 1, position: { start: { offset: -1 }, end: { offset: 3 } } },
-        { level: 1, position: { start: { offset: 8 }, end: { offset: Number.NaN } } },
+        { heading: "Front", level: 1, position: { start: { offset: -1 }, end: { offset: 3 } } },
+        { heading: "Back", level: 1, position: { start: { offset: 8 }, end: { offset: Number.NaN } } },
       ]),
     ).toBeNull();
   });

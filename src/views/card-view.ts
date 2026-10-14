@@ -166,7 +166,7 @@ export class CardView extends ItemView {
     if (card === null) {
       show(
         this.message(
-          "This note has the flashcard tag, but is not a complete card. It needs two H1 headings: the text under the first is the front, the text under the second is the back.",
+          "This note has the flashcard tag, but is not a complete card. It needs an H1 heading named Front and one named Back.",
         ),
       );
       return;

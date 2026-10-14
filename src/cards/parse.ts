@@ -1,7 +1,7 @@
 export interface CardSides {
-  /** Markdown shown on the front: the body under the first H1. */
+  /** Markdown shown on the front: the body under the H1 named "Front". */
   front: string;
-  /** Markdown shown on the back: the body under the second H1. */
+  /** Markdown shown on the back: the body under the H1 named "Back". */
   back: string;
 }
 
@@ -10,6 +10,7 @@ export interface CardSides {
  * Markdown parsing (code fences, front matter, and so on); we only slice by its offsets.
  */
 export interface HeadingLike {
+  heading: string;
   level: number;
   position: {
     start: { offset: number };
@@ -20,35 +21,39 @@ export interface HeadingLike {
 /**
  * Build a card from a note's text and the heading positions Obsidian parsed for it.
  *
- * The H1s are labels: the first H1 starts the front and the second starts the back, and
- * the heading text itself is not part of the card. Each side is the text between its H1
- * and the next H1 (or the end of the note). Text before the first H1, including front
- * matter, and any H1 sections after the second are ignored.
+ * Each H1 names a field: the body under "Front" is the front and the body under "Back" is
+ * the back (names are matched ignoring case and surrounding spaces). The heading text itself
+ * is not part of the card. A field's body runs from its H1 to the next H1 of any name (or the
+ * end of the note), so the fields may come in any order. Text before the first H1, including
+ * front matter, and H1 sections with other names are ignored. If a name is used twice, the
+ * first one wins.
  *
- * Returns null if there are fewer than two H1s, an offset does not fit the text (the
- * metadata is out of date for this text), or a side is empty.
+ * Returns null if Front or Back is missing or empty, or an offset does not fit the text (the
+ * metadata is out of date for this text).
  */
 export function sidesFromHeadings(content: string, headings: readonly HeadingLike[]): CardSides | null {
   const h1s = headings.filter((h) => h.level === 1);
-  const first = h1s[0];
-  const second = h1s[1];
-  if (!first || !second) return null;
-
-  const third = h1s[2];
-  const bounds = [first.position.start.offset, first.position.end.offset, second.position.start.offset, second.position.end.offset];
-  if (third) bounds.push(third.position.start.offset);
 
   // Offsets must be inside the text and ascending, and each H1 must really start with "#".
   // If not, the cache was built from a different version of the text.
-  for (let i = 0; i < bounds.length; i++) {
-    const b = bounds[i]!;
-    if (!Number.isInteger(b) || b < 0 || b > content.length) return null;
-    if (i > 0 && b < bounds[i - 1]!) return null;
+  let previous = 0;
+  for (const h of h1s) {
+    const { start, end } = h.position;
+    for (const b of [start.offset, end.offset]) {
+      if (!Number.isInteger(b) || b < previous || b > content.length) return null;
+      previous = b;
+    }
+    if (content[start.offset] !== "#") return null;
   }
-  if (content[first.position.start.offset] !== "#" || content[second.position.start.offset] !== "#") return null;
 
-  const front = content.slice(first.position.end.offset, second.position.start.offset).trim();
-  const back = content.slice(second.position.end.offset, third ? third.position.start.offset : content.length).trim();
+  const body = (name: string): string => {
+    const i = h1s.findIndex((h) => h.heading.trim().toLowerCase() === name);
+    if (i < 0) return "";
+    const next = h1s[i + 1];
+    return content.slice(h1s[i]!.position.end.offset, next ? next.position.start.offset : content.length).trim();
+  };
+  const front = body("front");
+  const back = body("back");
   if (front === "" || back === "") return null;
   return { front, back };
 }
