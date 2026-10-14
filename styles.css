@@ -1,0 +1,33 @@
+.obsidiflash-card-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-3);
+  padding: var(--size-4-4);
+  outline: none;
+}
+
+.obsidiflash-card-bar {
+  display: flex;
+  gap: var(--size-4-2);
+}
+
+.obsidiflash-card-bar button.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.obsidiflash-card-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--size-4-4);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+}
+
+.obsidiflash-card-message {
+  color: var(--text-muted);
+}
+
+.obsidiflash-setting-status {
+  color: var(--text-error);
+}
