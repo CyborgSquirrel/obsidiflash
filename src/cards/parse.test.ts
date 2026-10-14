@@ -36,8 +36,10 @@ describe("sidesFromHeadings", () => {
     expect(parse("# Notes\nmine\n# Back\na\n# Front\nq\n# Extra\nignored")).toEqual({ front: "q", back: "a" });
   });
 
-  it("ignores case and surrounding spaces in the names", () => {
-    expect(parse("# front \nq\n# BACK\na")).toEqual({ front: "q", back: "a" });
+  it("matches names case-sensitively, ignoring surrounding spaces", () => {
+    expect(parse("# Front \nq\n# Back\na")).toEqual({ front: "q", back: "a" });
+    expect(parse("# front\nq\n# Back\na")).toBeNull();
+    expect(parse("# Front\nq\n# BACK\na")).toBeNull();
   });
 
   it("works with CRLF line endings", () => {

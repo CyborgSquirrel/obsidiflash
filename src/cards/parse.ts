@@ -22,7 +22,7 @@ export interface HeadingLike {
  * Build a card from a note's text and the heading positions Obsidian parsed for it.
  *
  * Each H1 names a field: the body under "Front" is the front and the body under "Back" is
- * the back (names are matched ignoring case and surrounding spaces). The heading text itself
+ * the back (names are case-sensitive; surrounding spaces are ignored). The heading text itself
  * is not part of the card. A field's body runs from its H1 to the next H1 of any name (or the
  * end of the note), so the fields may come in any order. Text before the first H1, including
  * front matter, and H1 sections with other names are ignored. If a name is used twice, the
@@ -47,13 +47,13 @@ export function sidesFromHeadings(content: string, headings: readonly HeadingLik
   }
 
   const body = (name: string): string => {
-    const i = h1s.findIndex((h) => h.heading.trim().toLowerCase() === name);
+    const i = h1s.findIndex((h) => h.heading.trim() === name);
     if (i < 0) return "";
     const next = h1s[i + 1];
     return content.slice(h1s[i]!.position.end.offset, next ? next.position.start.offset : content.length).trim();
   };
-  const front = body("front");
-  const back = body("back");
+  const front = body("Front");
+  const back = body("Back");
   if (front === "" || back === "") return null;
   return { front, back };
 }
