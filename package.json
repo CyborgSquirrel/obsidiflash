@@ -1,5 +1,5 @@
 {
-  "name": "obsiflash",
+  "name": "obsidiflash",
   "version": "0.0.1",
   "description": "Anki-style spaced repetition flashcards with FSRS scheduling for Obsidian.",
   "main": "main.js",
